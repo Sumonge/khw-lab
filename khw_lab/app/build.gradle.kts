@@ -22,6 +22,8 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // 用 debug keystore 给 release 签名,便于直接发布/安装(个人项目,无正式证书)
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
