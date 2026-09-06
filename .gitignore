@@ -1,0 +1,24 @@
+# ===== Android / Gradle(由 Android Studio 生成)=====
+.gradle/
+build/
+local.properties
+.idea/
+.kotlin/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ===== 通用 =====
+.DS_Store
+
+# ===== 本机工具产物 =====
+# Arduino/工具生成的检查副本(如 _check_syntax.sh 的临时 .cpp)
+/tmp/
+*.check.cpp
+
+# ===== 不纳入仓库 =====
+# 空白 Arduino 模板(未使用)
+sketch_aug31a/
+# 固件诊断脚本(临时排查用)
+esp32-s3-cam/firmware/diagnostic_pinscan/
