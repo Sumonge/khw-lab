@@ -47,13 +47,14 @@
 
 | action | params | data |
 |---|---|---|
-| `lock` | 无 | `{"state":"locked"}` |
-| `unlock` | 无 | `{"state":"unlocked"}` |
-| `toggle` | 无 | `{"state":"locked"\|"unlocked"}` |
+| `lock` | 无 | `{"state":"locked","since":<epoch_ms>}` |
+| `unlock` | 无 | `{"state":"unlocked","since":<epoch_ms>}` |
+| `toggle` | 无 | `{"state":"locked"\|"unlocked","since":<epoch_ms>}` |
 | `status` | 无 | `{"state":"locked"\|"unlocked","since":<epoch_ms>}` |
 
-- 动作执行后:模式 LED 触发「动作橙短闪」;状态变化推 WS(见 §5)。
-- 动作互斥:动作执行期间返回 `busy`;锁动作 ≤500ms(继电器/电磁锁吸合时间),超过判 `hw`。
+- **`since` 语义**:NTP 同步后为 epoch 毫秒(约 1.78e12);未同步(配网后 NTP 尚未成功)回退为设备启动毫秒(<2^32),App 按数量级区分展示。**所有动作与状态变化统一带 `since`,不再区分 status 与否。**
+- 动作执行后:模式 LED 触发「动作橙短闪」;**仅状态实际变化才推 WS**(§5),`status` 轮询与无变化动作不推。
+- 动作互斥:150ms 冷却窗口内返回 `busy`;无反馈电磁锁 GPIO 切换即时完成,不判 `hw`。
 
 **摄像头板**:注册 `status`(= `/status` 等价)与 `reboot`(可选)。其余产品动作见各自设计。
 
@@ -65,8 +66,8 @@
 **设备→App push**:
 
 ```
-{"type":"status","data":{"state":"locked","since":1234567890}}   // 状态变化即推
-{"type":"hello","data":{"deviceId":"esp32lock-xxxxxx","fwVersion":"0.1.0","mode":"online"}}  // 握手后首帧
+{"type":"status","data":{"state":"locked","since":1234567890}}   // 状态变化即推, since 同 §4(epoch_ms 主, 未同步=启动 ms)
+{"type":"hello","data":{"deviceId":"esp32lock-xxxxxx","fwVersion":"0.2.0","mode":"online"}}  // 握手后首帧
 ```
 
 **App→设备 cmd**(可选):
@@ -128,6 +129,7 @@
 | `device` | `id` | 设备 ID(缺省按 MAC 派生) | 首启 |
 | `cam` | `framesize/quality/vflip/hmirror` | 摄像头设置(M1) | 设置 |
 | `lock` | `state` | 锁最后状态 | 每次动作 |
+| `lock` | `unlockMs` | 自动回锁时长(毫秒, 0=关闭) | 设置页 POST /settings |
 
 ## 9. App 契约(:core 扩展)
 
@@ -145,4 +147,4 @@ class DeviceClient(device: Device, token: String?) {
 - `PreferencesDeviceStore`:`Device(id,type,host,port,name)` 持久化 + **新增 token**。
 - 配网两种路径统一产出 `ProvisionResult(deviceId, token, host)`,由 ProvisionViewModel 持久化。
 - BLE 配网:Android 12+ 蓝牙权限(扫描/连接)在 33+ 归 `BLUETOOTH_SCAN`/`BLUETOOTH_CONNECT`;12–32 用 `BLUETOOTH_SCAN`/`BLUETOOTH_CONNECT`(运行时)或旧 `BLUETOOTH`/`BLUETOOTH_ADMIN`(manifest)。扫描过滤 `6b687763-...`(camera)/`6b68776c-...`(lock)按产品选择。
-- 锁卡片 `:feature-lock`:`Tile` 显示锁状态图标;`Detail` 大锁按钮(lock/unlock/toggle)+ 状态推送(WS);`Settings` 重命名/删除(宿主通用)+ 锁专属设置(默认动作、开锁时常)。
+- 锁卡片 `:feature-lock`:`Tile` 显示锁状态图标;`Detail` 大锁按钮(lock/unlock/toggle)+ 状态推送(WS);`Settings` 重命名/删除(宿主通用)+ 锁专属设置(`unlockSec` 自动回锁秒数, 单位**秒**, 0=关闭, 固件存毫秒 `lock/unlockMs`)。

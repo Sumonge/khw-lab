@@ -34,6 +34,9 @@ import okio.BufferedSource
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+/** 401 专用异常:token 缺失/失效(如 M1 存量设备、设备被重置回配网态)。上层据此提示重新配网。 */
+class UnauthorizedException(message: String) : IOException(message)
+
 /**
  * 所有插件共用的设备 I/O 基座。一个 Device 对应一个实例(由宿主缓存复用,
  * 见 HomeViewModel.clientFor:同 id 恒返回同一实例,probe/stream/settings 共享
@@ -78,6 +81,7 @@ class DeviceClient(
     suspend fun get(path: String): JsonElement = withContext(Dispatchers.IO) {
         val req = Request.Builder().url(device.baseUrl + path).get().auth().build()
         http.newCall(req).execute().use { resp ->
+            if (resp.code == 401) throw UnauthorizedException("HTTP 401")
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             try {
                 json.parseToJsonElement(resp.body?.string() ?: "{}")
@@ -97,6 +101,7 @@ class DeviceClient(
             .auth()
             .build()
         http.newCall(req).execute().use { resp ->
+            if (resp.code == 401) throw UnauthorizedException("HTTP 401")
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             try {
                 json.parseToJsonElement(resp.body?.string() ?: "{}")

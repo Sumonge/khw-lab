@@ -32,22 +32,28 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.khwlab.hub.core.model.ConnectionState
 import com.khwlab.hub.core.model.Device
 import com.khwlab.hub.core.net.DeviceClient
-import com.khwlab.hub.core.net.int
+import com.khwlab.hub.core.net.UnauthorizedException
+import com.khwlab.hub.core.net.long
 import com.khwlab.hub.core.net.str
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * 电磁锁详情页:大锁按钮(toggle)+ lock/unlock + WS 状态实时推送。
  * 复用宿主传入的同一 DeviceClient(与设置页共享连接状态,不新建连接)。
  *
- * 状态解析防御两种结构(契约 §4 与固件实现不一致,已列入改进清单):
- *   - 动作响应(顶层):{"ok":true,"state":"locked","since":<ms>}
- *   - WS push(包 data):{"type":"status","data":{"ok":true,"state":"...","since":...}}
- * since 为设备启动毫秒(非 epoch),仅展示,不做换算。
- * 设备离线/固件异常一律显示错误 + 可重试,绝不抛异常闪退。
+ * 状态解析(契约 §4/§5 统一为 data 包裹结构):
+ *   - 动作响应:{"ok":true,"data":{"state":"locked|unlocked","since":<epoch_ms>}}
+ *   - WS push:{"type":"status","data":{"state":"...","since":<epoch_ms>}}
+ * since 语义:固件 NTP 同步后为 epoch 毫秒(≈1.78e12), 未同步回退为设备启动毫秒
+ * (<2^32), 显示时按数量级区分, 不做跨类型换算。
+ * 401(未配对/M1 存量/设备被重置)→ 提示重新配网; 设备离线/固件异常一律显示
+ * 错误 + 可重试, 绝不抛异常闪退。
  */
 @Composable
 fun LockDetailScreen(device: Device, client: DeviceClient) {
@@ -60,15 +66,15 @@ fun LockDetailScreen(device: Device, client: DeviceClient) {
     var error by remember { mutableStateOf<String?>(null) }
     var retryKey by remember { mutableStateOf(0) }
 
-    // 动作响应与 WS push 统一入口:data 内优先,顶层兜底
+    // 动作响应与 WS push 统一入口:data 内优先,顶层兜底(兼容旧固件)
     fun applyStatus(el: kotlinx.serialization.json.JsonElement?) {
         val obj = el as? JsonObject ?: return
         (obj["data"] as? JsonObject)?.let { data ->
             data.str("state")?.let { lockState = it }
-            data.int("since")?.let { since = it.toLong() }
+            data.long("since")?.let { since = it }
         }
         obj.str("state")?.let { lockState = it }
-        obj.int("since")?.let { since = it.toLong() }
+        obj.long("since")?.let { since = it }
     }
 
     fun send(name: String) {
@@ -79,6 +85,8 @@ fun LockDetailScreen(device: Device, client: DeviceClient) {
                 applyStatus(client.action(name))
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: UnauthorizedException) {
+                error = "设备未配对或令牌失效, 请删除设备后重新配网"
             } catch (e: Exception) {
                 error = "操作失败:设备未连接"
             } finally {
@@ -86,6 +94,18 @@ fun LockDetailScreen(device: Device, client: DeviceClient) {
             }
         }
     }
+
+    // since 显示:epoch 毫秒 → 墙钟(手机本地时区); 启动毫秒 → "运行 N 秒"
+    fun formatSince(ms: Long): String =
+        if (ms > 100_000_000_000L) {
+            try {
+                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(ms))
+            } catch (_: Exception) {
+                "设备时间未知"
+            }
+        } else {
+            "设备运行 ${ms / 1000} 秒"
+        }
 
     // 进页拉一次当前状态(离线会走 error 分支)
     LaunchedEffect(device.id, retryKey) { send("status") }
@@ -132,7 +152,7 @@ fun LockDetailScreen(device: Device, client: DeviceClient) {
         since?.let {
             Spacer(Modifier.height(4.dp))
             Text(
-                "状态变更于设备运行 ${it / 1000} 秒",
+                "状态变更于 ${formatSince(it)}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.outline,
             )

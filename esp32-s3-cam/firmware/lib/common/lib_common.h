@@ -83,6 +83,10 @@ bool khwConfigSet(const char* ns, const char* key, const String& val);
 #ifndef KHW_MODE_LED_PIN
 #error "lib/common: KHW_MODE_LED_PIN not defined (set in board .ino)"
 #endif
+// 板级在 .ino 顶部可选覆盖锁 IO 引脚(默认 GPIO3 → AO3400 低边驱动)。
+#ifndef KHW_LOCK_PIN
+#define KHW_LOCK_PIN 3
+#endif
 
 class KhwModeLed {
 public:
