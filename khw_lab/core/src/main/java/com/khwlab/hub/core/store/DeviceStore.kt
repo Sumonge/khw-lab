@@ -8,6 +8,12 @@ interface DeviceStore {
     /** 用户改过的显示名,未改过返回 null。 */
     fun displayName(id: String): String?
 
+    /** 配网成功后固件下发的共享令牌(契约 §2);未配过网返回 null。 */
+    fun token(id: String): String?
+
+    /** 保存配网下发的令牌。 */
+    fun saveToken(id: String, token: String)
+
     /** 是否被用户删除(删除后不再自动发现)。 */
     fun isDeleted(id: String): Boolean
 

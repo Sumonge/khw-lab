@@ -8,7 +8,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 
-/** 截图存相册:通过 MediaStore 写入 Pictures/LabHub(免存储权限,API 29+)。 */
+/** 截图存相册:通过 MediaStore 写入 Pictures/khw_hub(免存储权限,API 29+)。 */
 object ScreenshotSaver {
 
     /** 返回最终 Uri,失败抛异常。调用方保证 API 28- 的 WRITE_EXTERNAL_STORAGE 已授权。 */
@@ -17,7 +17,7 @@ object ScreenshotSaver {
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/LabHub")
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/khw_hub")
                 put(MediaStore.Images.Media.IS_PENDING, 1)
             }
         }

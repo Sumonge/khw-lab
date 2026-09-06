@@ -16,7 +16,7 @@ import kotlinx.coroutines.flow.asSharedFlow
  */
 class DeviceDiscovery(private val context: Context) {
 
-    private val serviceTypes = listOf("_esp32cam._tcp")
+    private val serviceTypes = listOf("_esp32cam._tcp", "_esp32lock._tcp")
 
     private val _devices = MutableSharedFlow<Device>(extraBufferCapacity = 16)
     val devices: SharedFlow<Device> = _devices.asSharedFlow()

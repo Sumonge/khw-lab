@@ -1,4 +1,4 @@
-# Lab Hub — ESP32-S3-CAM 智能产品平台 App(M1)
+# khw_hub — ESP32-S3-CAM 智能产品平台 App(M1)
 
 配套固件在 `../esp32-s3-cam/firmware/board-camera/`。本 App 负责发现、连接、查看 ESP32-S3-CAM,并以"卡槽插件"架构为后续产品(运动/灯源/声量)留位。完整设计见 `../esp32-s3-cam/PLAN.md`。
 

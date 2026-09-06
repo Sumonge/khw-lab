@@ -41,7 +41,7 @@ fun HomeScreen(
     val devices by vm.devices.collectAsStateWithLifecycle()
 
     Scaffold(
-        topBar = { CenterAlignedTopAppBar(title = { Text("Lab Hub") }) },
+        topBar = { CenterAlignedTopAppBar(title = { Text("khw_hub") }) },
         floatingActionButton = {
             FloatingActionButton(onClick = onAdd) {
                 Icon(Icons.Filled.Add, contentDescription = "配网")
@@ -59,7 +59,7 @@ fun HomeScreen(
             ) {
                 Text("还没有设备", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(8.dp))
-                Text("点右下角 + 给 ESP32-CAM 配网", style = MaterialTheme.typography.bodyMedium)
+                Text("点右下角 + 给摄像头或电磁锁配网", style = MaterialTheme.typography.bodyMedium)
             }
         } else {
             LazyVerticalGrid(

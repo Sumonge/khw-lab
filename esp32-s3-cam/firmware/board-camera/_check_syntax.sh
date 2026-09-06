@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# 固件 0.2.5 语法校验:等价 Arduino 流水线 -fsyntax-only(不改任何文件)
+# 固件 0.3.0 语法校验:等价 Arduino 流水线 -fsyntax-only(不改任何文件)
 # 用法: bash _check_syntax.sh  (见 khwlab-project-status 记忆:已用本机 esp-x32 工具链复核过)
+# 覆盖 board-camera(ESP32-S3, xtensa) 及 lib/common/*.cpp;
+# board-lock(XIAO C3, riscv32) 用同目录 _check_syntax_c3.sh。
+# 要点:
+#   - 头文件: 直接注入 $SDK/flags/includes(完整 -iwithprefixbefore 列表,含 bt/... NimBLE、
+#     freertos xtensa port、soc/esp32s3、esp_rom/esp32s3 等),绝不手写(M2 引入 BLE 后
+#     手写列表必然漏 bt 路径 → esp_bt.h No such file;与 _check_syntax_c3.sh 同法)
+#   - defines:  照搬 $SDK/flags/defines(单行,含 CHIP_HAVE_CONFIG_H 等),跳过含引号的 -D
 set -u
 
 F="C:/Users/14919/Desktop/khw_lab/esp32-s3-cam/firmware/board-camera/board-camera.ino"
+FW="C:/Users/14919/Desktop/khw_lab/esp32-s3-cam/firmware"
 P="C:/Users/14919/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11"
 SDK="C:/Users/14919/AppData/Local/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.11"
 TOOL="C:/Users/14919/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/xtensa-esp-elf-g++.exe"
@@ -13,8 +21,15 @@ C="/tmp/board-camera-check.cpp"
 cat "$F" > "$C"
 
 # 模拟 Arduino 预处理器的自动原型生成:为所有函数生成前向声明。
-# 校验副本里补一条 streamWriteAll 前向声明(Arduino 流水线本来就会生成,这里等价复刻,不改 .ino)。
-sed -i '/^#include <errno.h>$/a bool streamWriteAll(NetworkClient& c, const uint8_t* buf, size_t len, uint32_t budgetMs);' "$C"
+# 校验副本里补原型(Arduino 流水线本来就会生成,这里等价复刻,不改 .ino)。
+# esp32-hal.h:正常 Arduino 编译在 .ino 前自动 #include <Arduino.h>(内含 esp32-hal.h → FreeRTOS),
+# 校验副本是直接合并 .ino,需手动补这个 include 才有 xTaskCreatePinnedToCore 声明。
+# 0.3.0:摄像头板已删除独立 factoryResetTask(并入 provision 状态机),只留 streamWriteAll。
+sed -i '/^#include <errno.h>$/a #include <esp32-hal.h>\nbool streamWriteAll(NetworkClient& c, const uint8_t* buf, size_t len, uint32_t budgetMs);' "$C"
+
+# 追加 lib/common 骨架头(与 .ino 里 #include "lib_common.h" 路径对齐)
+# (骨架头若存在即解析;.ino 已 include 时此追加无害)
+printf '\n#include "lib_common.h"\n' >> "$C"
 
 DEFS=(
   -DESP32
@@ -59,235 +74,55 @@ ARGS=(
   "-I$P/libraries/FS/src"
   "-I$P/libraries/ESPmDNS/src"
   "-I$P/libraries/Preferences/src"
+  "-I$P/libraries/BLE/src"
+  "-I$P/libraries/SimpleBLE/src"
+  "-I$FW/lib/common"
+  "-I$P/libraries/base64/src"
   -iprefix "$SDK/include/"
-  -iwithprefixbefore newlib/platform_include
-  -iwithprefixbefore freertos/config/include
-  -iwithprefixbefore freertos/config/include/freertos
-  -iwithprefixbefore freertos/config/xtensa/include
-  -iwithprefixbefore freertos/FreeRTOS-Kernel/include
-  -iwithprefixbefore freertos/FreeRTOS-Kernel/portable/xtensa/include
-  -iwithprefixbefore freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos
-  -iwithprefixbefore freertos/FreeRTOS-Kernel/portable/xtensa/include/freertos
-  -iwithprefixbefore freertos/esp_additions/include
-  -iwithprefixbefore freertos/FreeRTOS-Kernel/include/freertos
-  -iwithprefixbefore esp_hw_support/include
-  -iwithprefixbefore esp_hw_support/include/soc
-  -iwithprefixbefore esp_hw_support/dma/include
-  -iwithprefixbefore esp_hw_support/ldo/include
-  -iwithprefixbefore esp_hw_support/port/esp32s3
-  -iwithprefixbefore esp_hw_support/port/esp32s3/include
-  -iwithprefixbefore heap/include
-  -iwithprefixbefore log/include
-  -iwithprefixbefore soc/include
-  -iwithprefixbefore soc/esp32s3
-  -iwithprefixbefore soc/esp32s3/include
-  -iwithprefixbefore soc/esp32s3/register
-  -iwithprefixbefore hal/include
-  -iwithprefixbefore hal/esp32s3/include
-  -iwithprefixbefore esp_rom/include
-  -iwithprefixbefore esp_rom/esp32s3/include
-  -iwithprefixbefore esp_rom/esp32s3/include/esp32s3
-  -iwithprefixbefore esp_common/include
-  -iwithprefixbefore esp_system/include
-  -iwithprefixbefore xtensa/esp32s3/include
-  -iwithprefixbefore xtensa/include
-  -iwithprefixbefore esp_timer/include
-  -iwithprefixbefore lwip/include
-  -iwithprefixbefore lwip/include/apps
-  -iwithprefixbefore lwip/lwip/src/include
-  -iwithprefixbefore lwip/port/include
-  -iwithprefixbefore lwip/port/freertos/include
-  -iwithprefixbefore lwip/port/esp32xx/include
-  -iwithprefixbefore lwip/port/esp32xx/include/arch
-  -iwithprefixbefore lwip/port/esp32xx/include/sys
-  -iwithprefixbefore espressif__esp-tflite-micro
-  -iwithprefixbefore espressif__esp-tflite-micro/third_party/gemmlowp
-  -iwithprefixbefore espressif__esp-tflite-micro/third_party/flatbuffers/include
-  -iwithprefixbefore espressif__esp-tflite-micro/third_party/ruy
-  -iwithprefixbefore espressif__esp-tflite-micro/third_party/kissfft
-  -iwithprefixbefore espressif__esp32-camera/driver/include
-  -iwithprefixbefore espressif__esp32-camera/conversions/include
-  -iwithprefixbefore driver/deprecated
-  -iwithprefixbefore driver/i2c/include
-  -iwithprefixbefore driver/touch_sensor/include
-  -iwithprefixbefore driver/twai/include
-  -iwithprefixbefore driver/touch_sensor/esp32s3/include
-  -iwithprefixbefore esp_pm/include
-  -iwithprefixbefore esp_ringbuf/include
-  -iwithprefixbefore esp_driver_gpio/include
-  -iwithprefixbefore esp_driver_pcnt/include
-  -iwithprefixbefore esp_driver_gptimer/include
-  -iwithprefixbefore esp_driver_spi/include
-  -iwithprefixbefore esp_driver_mcpwm/include
-  -iwithprefixbefore esp_driver_i2s/include
-  -iwithprefixbefore esp_driver_sdmmc/include
-  -iwithprefixbefore sdmmc/include
-  -iwithprefixbefore esp_driver_sdspi/include
-  -iwithprefixbefore esp_driver_sdio/include
-  -iwithprefixbefore esp_driver_dac/include
-  -iwithprefixbefore esp_driver_rmt/include
-  -iwithprefixbefore esp_driver_tsens/include
-  -iwithprefixbefore esp_driver_sdm/include
-  -iwithprefixbefore esp_driver_i2c/include
-  -iwithprefixbefore esp_driver_uart/include
-  -iwithprefixbefore vfs/include
-  -iwithprefixbefore esp_driver_ledc/include
-  -iwithprefixbefore esp_driver_parlio/include
-  -iwithprefixbefore esp_driver_usb_serial_jtag/include
-  -iwithprefixbefore esp_driver_twai/include
-  -iwithprefixbefore espressif__esp_jpeg/include
-  -iwithprefixbefore esp_eth/include
-  -iwithprefixbefore esp_event/include
-  -iwithprefixbefore esp_wifi/include
-  -iwithprefixbefore esp_wifi/include/local
-  -iwithprefixbefore esp_phy/include
-  -iwithprefixbefore esp_phy/esp32s3/include
-  -iwithprefixbefore esp_netif/include
-  -iwithprefixbefore mbedtls/port/include
-  -iwithprefixbefore mbedtls/mbedtls/include
-  -iwithprefixbefore mbedtls/mbedtls/library
-  -iwithprefixbefore mbedtls/esp_crt_bundle/include
-  -iwithprefixbefore fatfs/diskio
-  -iwithprefixbefore fatfs/src
-  -iwithprefixbefore fatfs/vfs
-  -iwithprefixbefore wear_levelling/include
-  -iwithprefixbefore esp_partition/include
-  -iwithprefixbefore app_update/include
-  -iwithprefixbefore bootloader_support/include
-  -iwithprefixbefore bootloader_support/bootloader_flash/include
-  -iwithprefixbefore esp_app_format/include
-  -iwithprefixbefore esp_bootloader_format/include
-  -iwithprefixbefore console
-  -iwithprefixbefore esp_vfs_console/include
-  -iwithprefixbefore nvs_flash/include
-  -iwithprefixbefore spi_flash/include
-  -iwithprefixbefore espressif__mdns/include
-  -iwithprefixbefore espressif__jsmn/include
-  -iwithprefixbefore spiffs/include
-  -iwithprefixbefore esp_http_client/include
-  -iwithprefixbefore espressif__json_generator/include
-  -iwithprefixbefore json/cJSON
-  -iwithprefixbefore espressif__esp_cam_sensor/include
-  -iwithprefixbefore espressif__esp_cam_sensor/sensors/gc2145/include
-  -iwithprefixbefore espressif__esp_sccb_intf/include
-  -iwithprefixbefore espressif__esp_sccb_intf/interface
-  -iwithprefixbefore espressif__esp_sccb_intf/sccb_i2c/include
-  -iwithprefixbefore espressif__cjson/cJSON
-  -iwithprefixbefore efuse/include
-  -iwithprefixbefore efuse/esp32s3/include
-  -iwithprefixbefore esp_security/include
-  -iwithprefixbefore pthread/include
-  -iwithprefixbefore esp_psram/include
-  -iwithprefixbefore esp_psram/device/include
-  -iwithprefixbefore app_trace/include
-  -iwithprefixbefore wpa_supplicant/include
-  -iwithprefixbefore wpa_supplicant/port/include
-  -iwithprefixbefore wpa_supplicant/esp_supplicant/include
-  -iwithprefixbefore esp_coex/include
-  -iwithprefixbefore esp_gdbstub/include
-  -iwithprefixbefore unity/include
-  -iwithprefixbefore cmock/CMock/src
-  -iwithprefixbefore esp_driver_bitscrambler/include
-  -iwithprefixbefore http_parser
-  -iwithprefixbefore esp-tls
-  -iwithprefixbefore esp-tls/esp-tls-crypto
-  -iwithprefixbefore esp_adc/include
-  -iwithprefixbefore esp_adc/interface
-  -iwithprefixbefore esp_adc/esp32s3/include
-  -iwithprefixbefore esp_driver_jpeg/include
-  -iwithprefixbefore esp_driver_ppa/include
-  -iwithprefixbefore esp_driver_touch_sens/include
-  -iwithprefixbefore esp_driver_touch_sens/hw_ver2/include
-  -iwithprefixbefore esp_hal_ieee802154/include
-  -iwithprefixbefore esp_hid/include
-  -iwithprefixbefore tcp_transport/include
-  -iwithprefixbefore esp_http_server/include
-  -iwithprefixbefore esp_https_ota/include
-  -iwithprefixbefore esp_https_server/include
-  -iwithprefixbefore esp_lcd/include
-  -iwithprefixbefore esp_lcd/interface
-  -iwithprefixbefore esp_lcd/rgb/include
-  -iwithprefixbefore protobuf-c/protobuf-c
-  -iwithprefixbefore protocomm/include/common
-  -iwithprefixbefore protocomm/include/security
-  -iwithprefixbefore protocomm/include/transports
-  -iwithprefixbefore protocomm/include/crypto/srp6a
-  -iwithprefixbefore protocomm/proto-c
-  -iwithprefixbefore esp_local_ctrl/include
-  -iwithprefixbefore espcoredump/include
-  -iwithprefixbefore espcoredump/include/port/xtensa
-  -iwithprefixbefore idf_test/include
-  -iwithprefixbefore idf_test/include/esp32s3
-  -iwithprefixbefore ieee802154/include
-  -iwithprefixbefore mqtt/esp-mqtt/include
-  -iwithprefixbefore nvs_sec_provider/include
-  -iwithprefixbefore perfmon/include
-  -iwithprefixbefore rt/include
-  -iwithprefixbefore touch_element/include
-  -iwithprefixbefore ulp/ulp_common/include
-  -iwithprefixbefore ulp/ulp_fsm/include
-  -iwithprefixbefore ulp/ulp_fsm/include/esp32s3
-  -iwithprefixbefore usb/include
-  -iwithprefixbefore wifi_provisioning/include
-  -iwithprefixbefore espressif__esp-nn/include
-  -iwithprefixbefore espressif__esp-nn/src/common
-  -iwithprefixbefore espressif__rmaker_cmd_resp/include
-  -iwithprefixbefore espressif__rmaker_common_events/include
-  -iwithprefixbefore espressif__rmaker_system_ctrl/include
-  -iwithprefixbefore espressif__rmaker_time_sync/include
-  -iwithprefixbefore espressif__rmaker_console/include
-  -iwithprefixbefore espressif__rmaker_work_queue/include
-  -iwithprefixbefore espressif__rmaker_common/include
-  -iwithprefixbefore espressif__cbor/tinycbor/src
-  -iwithprefixbefore espressif__esp_diag_data_store/src/rtc_store
-  -iwithprefixbefore espressif__esp_diag_data_store/include
-  -iwithprefixbefore espressif__esp-serial-flasher/include
-  -iwithprefixbefore espressif__esp-serial-flasher/port
-  -iwithprefixbefore espressif__esp_rcp_update/include
-  -iwithprefixbefore espressif__usb_host_uvc/include
-  -iwithprefixbefore espressif__dl_fft
-  -iwithprefixbefore espressif__dl_fft/base
-  -iwithprefixbefore espressif__dl_fft/base/isa
-  -iwithprefixbefore espressif__esp-dsp/modules/dotprod/include
-  -iwithprefixbefore espressif__esp-dsp/modules/support/include
-  -iwithprefixbefore espressif__esp-dsp/modules/support/mem/include
-  -iwithprefixbefore espressif__esp-dsp/modules/windows/include
-  -iwithprefixbefore espressif__esp-dsp/modules/windows/hann/include
-  -iwithprefixbefore espressif__esp-dsp/modules/windows/blackman/include
-  -iwithprefixbefore espressif__esp-dsp/modules/windows/blackman_harris/include
-  -iwithprefixbefore espressif__esp-dsp/modules/windows/nuttall/include
-  -iwithprefixbefore espressif__esp-dsp/modules/windows/flat_top/include
-  -iwithprefixbefore espressif__esp-dsp/modules/fft/include
-  -iwithprefixbefore espressif__esp-dsp/modules/dct/include
-  -iwithprefixbefore espressif__esp-dsp/modules/conv/include
-  -iwithprefixbefore espressif__esp-dsp/modules/common/include
-  -iwithprefixbefore espressif__esp-dsp/modules/matrix/mul/test/include
-  -iwithprefixbefore espressif__esp-dsp/modules/kalman/ekf/include
-  -iwithprefixbefore espressif__esp-dsp/modules/kalman/ekf_imu13states/include
-  -iwithprefixbefore chmorgan__esp-libhelix-mp3/libhelix-mp3/pub
-  -iwithprefixbefore espressif__esp-modbus/modbus/mb_transports
-  -iwithprefixbefore espressif__esp-modbus/modbus/mb_controller/common/include
-  -iwithprefixbefore espressif__esp-modbus/modbus/mb_objects/common/include
-  -iwithprefixbefore espressif__esp-modbus/modbus/mb_ports/common/include
-  -iwithprefixbefore espressif__esp-modbus/modbus/mb_ports/serial
-  -iwithprefixbefore espressif__esp-modbus/modbus/mb_ports/tcp
-  -iwithprefixbefore espressif__esp-zboss-lib/include
-  -iwithprefixbefore espressif__esp-zigbee-lib/include
-  -iwithprefixbefore espressif__esp-zigbee-lib/include/radio_spinel
-  -iwithprefixbefore espressif__libsodium/port_include
-  -iwithprefixbefore espressif__libsodium/libsodium/src/libsodium/include
-  -iwithprefixbefore espressif__esp_modem/include
-  -iwithprefixbefore espressif__esp_modem/command/include
-  -iwithprefixbefore espressif__esp_daylight/include
-  -iwithprefixbefore espressif__esp_schedule/include
-  -iwithprefixbefore espressif__network_provisioning/include
-  -iwithprefixbefore espressif__esp_rainmaker/include
-  -iwithprefixbefore espressif__qrcode/include
-  -iwithprefixbefore joltwallet__littlefs/include
-  -iwithprefixbefore arduino_tinyusb/tinyusb/src
-  -iwithprefixbefore arduino_tinyusb/include
-  -iwithprefixbefore fb_gfx/include
 )
 
-"$TOOL" "${ARGS[@]}" "${DEFS[@]}" "$C" 2>&1 | head -80
-exit "${PIPESTATUS[0]}"
+# 直接注入 esp32s3-libs 完整 -iwithprefixbefore 列表(单行,read -r 整行读取按空格切分;
+# 含 bt/host/nimble、bt/include/esp32c3/include(esp_bt.h)、freertos xtensa port 等全量路径)
+INCLUDE_ARGS=()
+read -r -a INCLUDE_ARGS < "$SDK/flags/includes"
+ARGS+=("${INCLUDE_ARGS[@]}")
+
+# defines 单行直接注入(与 cpp_flags 相同来源,避免手写遗漏 CHIP_HAVE_CONFIG_H 等)
+DEFINES_ARGS=()
+read -r -a DEFINES_ARGS < "$SDK/flags/defines"
+# 仅保留纯 -D 宏(丢弃任何带空格/引号的片段,那些会破坏命令行解析)
+for d in "${DEFINES_ARGS[@]}"; do
+  case "$d" in
+    -D*\"*) :;;        # 跳过含引号的 -D(如版本字符串宏,会引发 <command-line> 警告)
+    -D*)    ARGS+=("$d");;
+    *)      :;;
+  esac
+done
+
+# lib/common/*.cpp 独立编译所需的板级宏(等价 board-camera.ino 顶部 #define;
+# 缺失会触发 lib_common.h 的 #error。这些文件不经过 .ino 合并,必须在此喂入)
+COMMON_DEFS=(
+  "${DEFS[@]}"
+  -DKHW_BOARD_TYPE=\"camera\"
+  -DKHW_DEVICE_NAME_PREFIX=\"KHW-CAM\"
+  -DKHW_SERVICE_TYPE=\"esp32cam\"
+  -DKHW_MODE_LED_GPIO
+  -DKHW_MODE_LED_PIN=21
+  -DKHW_BOOT_PIN=0
+)
+
+echo "== 1/2 board-camera.ino(+lib_common.h) =="
+"$TOOL" "${ARGS[@]}" "${DEFS[@]}" "$C" 2>&1 | head -80 || true
+
+echo "== 2/2 lib/common/*.cpp =="
+LIBFAIL=0
+for CF in "$FW"/lib/common/*.cpp; do
+  # 通过 COMMON_DEFS 供板级宏,无需预合并 .ino
+  "$TOOL" "${ARGS[@]}" "${COMMON_DEFS[@]}" "$CF" 2>&1 | head -40
+  # bash 管道让 $? 取到的是 head 的退出码;改用 PIPESTATUS 判断编译结果
+  rc=("${PIPESTATUS[@]}")
+  if [ "${rc[0]}" -ne 0 ]; then LIBFAIL=1; fi
+done
+
+[ "$LIBFAIL" -eq 0 ] && exit 0
+exit 1

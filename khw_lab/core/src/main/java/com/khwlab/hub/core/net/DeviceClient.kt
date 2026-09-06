@@ -6,20 +6,28 @@ import com.khwlab.hub.core.model.ConnectionState
 import com.khwlab.hub.core.model.Device
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.encodeUtf8
 import okio.BufferedSource
@@ -30,8 +38,15 @@ import java.util.concurrent.TimeUnit
  * 所有插件共用的设备 I/O 基座。一个 Device 对应一个实例(由宿主缓存复用,
  * 见 HomeViewModel.clientFor:同 id 恒返回同一实例,probe/stream/settings 共享
  * [connection] 状态与已建立连接,避免各页面各自新建导致重复连接与超时)。
+ *
+ * [token] 为配网成功后固件下发的共享令牌(契约 §2)。M2 起 /action、/unpair、
+ * /stream 与 WebSocket 都要求 X-Khw-Token;M1 存量设备(未配对过)传 null:
+ * 请求不带令牌头,ws() 返回空流(固件 0.3.0 起 /stream 无令牌会 401)。
  */
-class DeviceClient(private val device: Device) {
+class DeviceClient(
+    private val device: Device,
+    val token: String? = null,
+) {
 
     /** 客户端是否仍对应当前设备地址与类型(host/port/type 未变时复用,变了需重建)。 */
     fun matches(d: Device): Boolean =
@@ -55,8 +70,13 @@ class DeviceClient(private val device: Device) {
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    /** 有令牌时给请求加 X-Khw-Token 头(M2 鉴权,契约 §2)。 */
+    private fun Request.Builder.auth(): Request.Builder = apply {
+        token?.let { header("X-Khw-Token", it) }
+    }
+
     suspend fun get(path: String): JsonElement = withContext(Dispatchers.IO) {
-        val req = Request.Builder().url(device.baseUrl + path).get().build()
+        val req = Request.Builder().url(device.baseUrl + path).get().auth().build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             try {
@@ -74,6 +94,7 @@ class DeviceClient(private val device: Device) {
         val req = Request.Builder()
             .url(device.baseUrl + path)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .auth()
             .build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
@@ -87,6 +108,17 @@ class DeviceClient(private val device: Device) {
             }
         }
     }
+
+    /**
+     * 动作总线(契约 §4):POST /action,body {"action":"<name>","params":{...}}。
+     * 锁板:lock/unlock/toggle/status;摄像头板:status/reboot。
+     * 未配对设备(M1 存量,无 token)会收 401。
+     */
+    suspend fun action(name: String, params: JsonObject = buildJsonObject { }): JsonElement =
+        post("/action", buildJsonObject {
+            put("action", name)
+            put("params", params)
+        })
 
     /** 可达性探测(周期心跳),返回是否在线。 */
     suspend fun probe(): Boolean = withContext(Dispatchers.IO) {
@@ -106,11 +138,12 @@ class DeviceClient(private val device: Device) {
     /**
      * MJPEG 帧流。断线自动重连,直到收集方取消。
      * 固件 /stream 返回 multipart/x-mixed-replace,边界行格式为 `--<boundary>\r\n`。
+     * 0.3.0 起 /stream 需令牌(否则 401),M1 存量设备(无 token)会一直重连。
      */
     fun frameStream(): Flow<Bitmap> = flow {
         while (true) {
             try {
-                val req = Request.Builder().url(device.baseUrl + "/stream").get().build()
+                val req = Request.Builder().url(device.baseUrl + "/stream").get().auth().build()
                 _connection.value = ConnectionState.CONNECTING
                 val resp = streamHttp.newCall(req).execute()
                 if (!resp.isSuccessful) {
@@ -152,6 +185,57 @@ class DeviceClient(private val device: Device) {
             delay(2000) // 断线重连间隔
         }
     }.flowOn(Dispatchers.IO)
+
+    /**
+     * WebSocket 推送流(契约 §5 §9):连 ws://host:8080/ws?token=,逐条透传设备
+     * push 的原始 JSON(hello/ping/status)。断线每 2s 重连,直到收集方取消。
+     * 未配过网(M1 存量,无 token)返回空流:固件对无令牌握手回 401,没有连的必要。
+     * 注意:必须关读超时——设备 hello 后只靠 30s ping 维持,10s 默认读超时会把
+     * 连接砍断导致无限重连。
+     */
+    fun ws(): Flow<String> {
+        val t = token ?: return emptyFlow()
+        return flow {
+            while (true) {
+                val queue = Channel<String>(Channel.UNLIMITED)
+                var webSocket: WebSocket? = null
+                val wsHttp = OkHttpClient.Builder()
+                    .connectTimeout(3, TimeUnit.SECONDS)
+                    .readTimeout(0, TimeUnit.MILLISECONDS)
+                    .build()
+                try {
+                    val listener = object : WebSocketListener() {
+                        override fun onMessage(webSocket: WebSocket, text: String) {
+                            queue.trySend(text)
+                        }
+
+                        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                            queue.close()
+                        }
+
+                        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                            queue.close()
+                        }
+                    }
+                    webSocket = wsHttp.newWebSocket(
+                        Request.Builder().url("ws://${device.host}:8080/ws?token=$t").build(),
+                        listener
+                    )
+                    // 阻塞收集,直到连接关闭/失败;设备 push 逐条 emit
+                    for (msg in queue) emit(msg)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 连接异常:等 2s 重连
+                } finally {
+                    webSocket?.close(1000, "client bye")
+                    wsHttp.connectionPool.evictAll()
+                    wsHttp.dispatcher.executorService.shutdown()
+                }
+                delay(2000)
+            }
+        }.flowOn(Dispatchers.IO)
+    }
 
     /** 遥测轮询(声量、位置等,摄像头用不到,给后续产品)。 */
     fun poll(path: String, intervalMs: Long): Flow<JsonElement> = flow {

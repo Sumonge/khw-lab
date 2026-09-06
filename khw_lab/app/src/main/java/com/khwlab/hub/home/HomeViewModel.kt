@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
+import kotlinx.serialization.json.buildJsonObject
 
 class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -61,15 +63,18 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         val updated = changed.firstOrNull { it.id == named.id } ?: named
-        val cached = clients[updated.id]
-        if (cached != null && !cached.matches(updated)) {
-            // 设备换 IP:重建客户端,避免 probe/stream 一直打旧地址
-            clients[updated.id] = DeviceClient(updated)
-        }
+        // 复用/重建逻辑集中在 clientFor:地址变化、类型变化或配网后 token 变化都会重建
+        clientFor(updated)
     }
 
-    fun clientFor(device: Device): DeviceClient =
-        clients.getOrPut(device.id) { DeviceClient(device) }
+    /** 复用/重建逻辑集中在这里:地址变化、类型变化或配网后 token 变化都会重建。UI 也经此取客户端。 */
+    fun clientFor(d: Device): DeviceClient {
+        val existing = clients[d.id]
+        val token = store.token(d.id)
+        // 已缓存且 token 一致 → 复用;地址/类型变化或配网后新拿到 token → 重建
+        if (existing != null && existing.token == token && existing.matches(d)) return existing
+        return DeviceClient(d, token).also { clients[d.id] = it }
+    }
 
     fun rename(id: String, newName: String) {
         if (newName.isBlank()) return
@@ -79,10 +84,26 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * 删除设备 = 本地隐藏 + 尝试让设备真正断网:
+     * 有客户端缓存(最近发现过)时对固件 POST /unpair,清其 WiFi 凭据重启回配网态,
+     * 之后不再自动发现。删除后用户仍可重新配网找回。
+     */
     fun delete(id: String) {
         store.delete(id)
-        clients.remove(id)
+        val client = clients.remove(id)
         _devices.update { list -> list.filterNot { it.id == id } }
+        if (client != null) {
+            viewModelScope.launch {
+                supervisorScope {
+                    try {
+                        client.post("/unpair", buildJsonObject { })
+                    } catch (_: Exception) {
+                        // 设备离线/不可达:本地删除已完成,固件侧下次通电仍是已配网状态,属可接受降级
+                    }
+                }
+            }
+        }
     }
 
     private fun startProbing() {

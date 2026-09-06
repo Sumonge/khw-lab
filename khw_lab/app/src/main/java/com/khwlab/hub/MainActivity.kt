@@ -30,7 +30,7 @@ import com.khwlab.hub.ui.theme.HubTheme
 class MainActivity : ComponentActivity() {
 
     companion object {
-        private const val TAG = "LabHub"
+        private const val TAG = "khw_hub"
     }
 
     private val permissionLauncher = registerForActivityResult(
@@ -48,6 +48,14 @@ class MainActivity : ComponentActivity() {
         // 以 VM 实际权限为准(33+ 需要 NEARBY 且要 LOCATION,缺一不可);
         // 只要请求过一次,VM 就知道不能再靠弹框拿权限了
         provisionVm.onPermissionHandled(result.values.all { it })
+    }
+
+    // 蓝牙配网的授权:31+ 需要 BLUETOOTH_SCAN + BLUETOOTH_CONNECT 两个运行时权限,
+    // 同意后自动开扫,拒绝则 BLE 路径给出明确原因(30- 走上面的位置权限即可扫 BLE)。
+    private val blePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        provisionVm.onBlePermissionHandled(result.values.all { it })
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -101,6 +109,43 @@ class MainActivity : ComponentActivity() {
                                 } else {
                                     // 首次请求:弹系统授权框,授权结果走 pickerPermissionLauncher
                                     pickerPermissionLauncher.launch(missing.toTypedArray())
+                                }
+                            },
+                            onRequestBlePermissions = {
+                                // 31+:BLE 扫描+连接是两个运行时权限;30- 已有位置权限即可扫 BLE
+                                if (Build.VERSION.SDK_INT >= 31) {
+                                    val missing = arrayOf(
+                                        Manifest.permission.BLUETOOTH_SCAN,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                    ).filter {
+                                        ContextCompat.checkSelfPermission(this, it) !=
+                                            PackageManager.PERMISSION_GRANTED
+                                    }
+                                    if (missing.isEmpty()) {
+                                        provisionVm.onBlePermissionHandled(true)
+                                    } else if (provisionVm.hasRequestedBlePermission()) {
+                                        // 上次请求过被拒:系统不会再弹,引导去系统设置手动开启
+                                        openAppSettings()
+                                    } else {
+                                        blePermissionLauncher.launch(missing.toTypedArray())
+                                    }
+                                } else {
+                                    // 30-:扫 BLE 需要位置权限(请求路径与 WiFi 扫描一致)
+                                    if (ContextCompat.checkSelfPermission(
+                                            this,
+                                            Manifest.permission.ACCESS_FINE_LOCATION,
+                                        ) != PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        if (provisionVm.hasRequestedBlePermission()) {
+                                            openAppSettings()
+                                        } else {
+                                            blePermissionLauncher.launch(
+                                                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                                            )
+                                        }
+                                    } else {
+                                        provisionVm.onBlePermissionHandled(true)
+                                    }
                                 }
                             },
                             onOpenAppSettings = { openAppSettings() },

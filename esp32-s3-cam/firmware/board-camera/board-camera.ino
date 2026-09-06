@@ -1,19 +1,25 @@
 /*
- * ESP32-S3-CAM 摄像头固件 (M1)
- * - 摄像头: GC2145,ESP32-S3-EYE 风格引脚(已确认)
- * - 配网: 无凭据时开 SoftAP "ESP32-CAM-Setup",浏览器/App 提交 /config
- * - 发现: mDNS "_esp32cam._tcp"
- * - API: /stream (MJPEG), /status (JSON), /settings (GET/POST)
+ * ESP32-S3-CAM 摄像头固件 (M1/M2, khw_hub 产品一)
+ * - 摄像头: GC2145,ESP32-S3-EYE 风格引脚
+ * - 配网:   BLE 优先(KHW-CAM-xxxx)+ SoftAP 兜底(ESP32-CAM-Setup),两者并存(CONTRACT §7)
+ * - 发现:   mDNS "_esp32cam._tcp" + UDP 3333
+ * - 模式 LED: 外接单色 LED(GPIO21,编译期宏 KHW_MODE_LED_PIN),8 态(CONTRACT §6)
+ * - API:    /status /config 免令牌; /settings /stream /action /unpair 令牌; /ws 8080 ?token=
+ * - 复用 lib/common:令牌/动作总线/模式LED/BLE配网/WS/HTTP 底座/配网状态机
  *
  * 烧录设置: ESP32S3 Dev Module, 16MB flash, OPI PSRAM,
  *           USB CDC On Boot = Disabled, Upload Speed = 115200
  */
+#define KHW_BOARD_TYPE "camera"
+#define KHW_DEVICE_NAME_PREFIX "KHW-CAM"
+#define KHW_SERVICE_TYPE "esp32cam"
+#define KHW_MODE_LED_GPIO
+#define KHW_MODE_LED_PIN 21
+#define KHW_BOOT_PIN 0
 
+#include "lib_common.h"
 #include "esp_camera.h"
-#include <WiFi.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
-#include <Preferences.h>
 #include <WiFiUdp.h>
 #include <lwip/sockets.h>
 #include <errno.h>
@@ -40,16 +46,22 @@
 #define CAM_PIN_PCLK   13
 
 #define AP_SSID       "ESP32-CAM-Setup"
-#define FW_VERSION    "0.2.5"   // rebuildCamera 每次从全局设置同步 frame_size/quality 再 deinit+init(0.2.4 只在回退分支更新 config → 切分辨率后相机仍按启动尺寸 init,所有分辨率都显示成启动分辨率 1024×768;0.2.3:设置 POST 值截断修复 vflip/hmirror 保存;0.2.2:有界 streamWriteAll 断开假死 /stream;0.2.1:robust JSON 配网)
+#define FW_VERSION    "0.3.0"   // 0.3.0(M2):接入 lib/common —— BLE 配网 + 共享令牌 + 模式LED + /ws + /action;
+                                //             /settings /stream 加令牌;/config 返回 token;配网改异步(不再阻塞 15s);
+                                //             BOOT 4s 由 provision 状态机统一处理(清凭据+清token)。0.2.6:独立
+                                //             factory reset 任务;/unpair 端点。0.2.5:rebuildCamera 每次从全局
+                                //             设置同步 frame_size/quality 再 deinit+init。0.2.4:回退分支更新 config
+                                //             导致所有分辨率按启动尺寸 init 的 bug。0.2.3:设置 POST 值截断修复
+                                //             vflip/hmirror 保存。0.2.2:有界 streamWriteAll 断开假死 /stream。
+                                //             0.2.1:robust JSON 配网。
 #define DEVICE_TYPE   "esp32cam"
 
-// UDP 发现兜底:App 发 "KHLAB_DISCOVER",设备回广播(PLAN §2 B2)
+// UDP 发现兜底:App 发 "KHLAB_DISCOVER",设备回广播(CONTRACT §3)
 #define UDP_PORT      3333
 #define DISCOVER_MAGIC "KHLAB_DISCOVER"
 
 // ============ 全局 ============
-WebServer server(80);
-Preferences prefs;
+Preferences prefs;       // 摄像头设置(cam ns;wifi/sec/device 由 lib/common 管理)
 WiFiUDP udp;
 bool   udpActive = false;
 
@@ -57,8 +69,6 @@ bool   udpActive = false;
 String udpAdvertise = "";
 
 String deviceId = "";   // esp32cam-xxxxxx
-String wifiSSID = "";
-String wifiPass = "";
 bool   apMode   = false;
 
 // 摄像头设置
@@ -143,7 +153,7 @@ bool initCamera() {
   return rebuildCamera();
 }
 
-// ============ 设置持久化 (NVS) ============
+// ============ 设置持久化 (NVS, "cam" ns) ============
 void loadSettings() {
   prefs.begin("cam", true);
   g_framesize = prefs.getInt("framesize", FRAMESIZE_XGA);
@@ -186,21 +196,6 @@ void applySettings() {
     s->set_reg(s, GC2145_ANALOG_MODE1, GC2145_BIT_VFLIP, g_vflip ? GC2145_BIT_VFLIP : 0);
     s->set_quality(s, g_quality);
   }
-}
-
-// ============ WiFi 凭据持久化 ============
-void loadWifiCreds() {
-  prefs.begin("wifi", true);
-  wifiSSID = prefs.getString("ssid", "");
-  wifiPass = prefs.getString("pass", "");
-  prefs.end();
-}
-
-void saveWifiCreds(const String& ssid, const String& pass) {
-  prefs.begin("wifi", false);
-  prefs.putString("ssid", ssid);
-  prefs.putString("pass", pass);
-  prefs.end();
 }
 
 // ============ 工具 ============
@@ -272,29 +267,24 @@ bool parseConfig(const String& body, String& ssid, String& pass) {
   return ssid.length() > 0;
 }
 
-// ============ HTTP 处理器 ============
-void handleStatus() {
-  String json = "{";
-  json += "\"id\":\"" + deviceId + "\",";
-  json += "\"type\":\"" DEVICE_TYPE "\",";
-  json += "\"fwVersion\":\"" FW_VERSION "\",";
-  json += "\"mode\":\"" + String(apMode ? "ap" : "sta") + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
-}
+// ============ HTTP 处理器(全部走 lib 共享服务器实例,端口 80) ============
 
 void handleSettingsGet() {
+  WebServer& srv = khwHttpServer();
+  if (!khwHttpAuthOK()) { khwHttpSend401(); return; }
   String json = "{";
   json += "\"resolution\":" + String(g_framesize) + ",";
   json += "\"quality\":" + String(g_quality) + ",";
   json += "\"vflip\":" + String(g_vflip ? "true" : "false") + ",";
   json += "\"hmirror\":" + String(g_hmirror ? "true" : "false");
   json += "}";
-  server.send(200, "application/json", json);
+  srv.send(200, "application/json", json);
 }
 
 void handleSettingsPost() {
-  String body = server.arg("plain");
+  WebServer& srv = khwHttpServer();
+  if (!khwHttpAuthOK()) { khwHttpSend401(); return; }
+  String body = srv.arg("plain");
   // 解析 resolution / quality / vflip / hmirror (App 端 POST 的 JSON body;浏览器不发设置 POST)。
   // 值截断到逗号或右花括号再取,避免取到后续字段("true,..." 整串比较恒失败 → 翻转/镜像存不上)。
   auto parseValue = [&](const char* key, String& out) -> bool {
@@ -335,35 +325,55 @@ void handleSettingsPost() {
   handleSettingsGet();
 }
 
+// 配网 /config —— 免令牌(SoftAP/BLE 配网态);覆盖 lib 的 JSON-only 版:
+// 兼容浏览器 form + JSON,响应带 deviceId 与共享 token(CONTRACT §1 §2)。
 void handleConfig() {
+  WebServer& srv = khwHttpServer();
   String ssid, pass;
-  String body = server.arg("plain");
-  // 诊断日志:配网 400 = 设备收到 /config 但 ssid 解析为空。打印收到的原始 body,
-  // 定位是 body 为空(WebServer 没把 JSON body 传进来)还是解析失败。
-  // (App 走 JSON → arg("plain");浏览器 form → arg("ssid"))。定位后删除。
-  Serial.printf("[config] body len=%d\n", body.length());
-  Serial.printf("[config] body: %s\n", body.c_str());
+  String body = srv.arg("plain");
   if (body.length() > 0) {
-    // JSON(供 App 用)
+    // JSON(App)或 form-urlencoded(body 透传)
     parseConfig(body, ssid, pass);
   } else {
     // 浏览器表单 form-urlencoded(WebServer 已解析成 arg)
-    ssid = server.arg("ssid");
-    pass = server.arg("password");
+    ssid = srv.arg("ssid");
+    pass = srv.arg("password");
   }
-  if (ssid.length() > 0) {
-    saveWifiCreds(ssid, pass);
-    server.send(200, "application/json", "{\"ok\":true}");
-    delay(300);
+  if (ssid.length() == 0 || ssid.length() > 32) {
+    srv.send(400, "application/json", "{\"ok\":false,\"error\":\"bad-ssid\"}");
+    return;
+  }
+  khwConfigSet("wifi", "ssid", ssid);
+  khwConfigSet("wifi", "pass", pass);
+  khwTokenEnsure();  // 生成/保证共享令牌(配网响应带回 App)
+  String resp = String("{\"ok\":true,\"deviceId\":\"") + deviceId +
+                "\",\"token\":\"" + khwTokenGet() + "\"}";
+  srv.send(200, "application/json", resp);
+  delay(300);
+  ESP.restart();
+}
+
+// 动作总线(CONTRACT §4):摄像头板注册 status(等价 /status 摘要)与 reboot(可选)
+static String handleAction(const String& action, const String& /*params*/) {
+  if (action == "status") {
+    String body = String("{\"ok\":true,\"deviceId\":\"") + deviceId +
+                  "\",\"mode\":\"" + (apMode ? "ap" : "online") +
+                  "\",\"fwVersion\":\"" FW_VERSION "\"}";
+    khwWsSend(String("{\"type\":\"status\",\"data\":") + body + "}");
+    return body;
+  }
+  if (action == "reboot") {
+    khwWsSend("{\"type\":\"status\",\"data\":{\"ok\":true,\"state\":\"reboot\"}}");
+    delay(500);
     ESP.restart();
-  } else {
-    Serial.printf("[config] ssid len=0 -> 400 (body above)\n");
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad request\"}");
   }
+  return "{\"ok\":false,\"error\":\"bad-action\"}";
 }
 
 void handleStream() {
-  WiFiClient client = server.client();
+  WebServer& srv = khwHttpServer();
+  if (!khwHttpAuthOK()) { khwHttpSend401(); return; }
+  WiFiClient client = srv.client();
   client.setNoDelay(true);   // 禁 Nagle:帧小、低延迟,数据尽快推给对端
   // 整条流(含 HTTP 头)都走 streamWriteAll 的有界发送:
   // 假死连接(对端消失、socket 半开)在预算时间内无进展即返回 false → 断开,
@@ -378,7 +388,17 @@ void handleStream() {
     client.stop();
     return;
   }
+  uint32_t srvTick = 0;   // 流内分片:lib/common 维护(BOOT 检测/WS 心跳/LED 状态机)
   while (client.connected()) {
+    uint32_t now = millis();
+    if (now - srvTick >= 200) {
+      // CONTRACT §6:摄像头板不新建任务,并入 loop();流服务期间 loop 被占,
+      // 这里分片推进,保证长按 BOOT 4s、WS 心跳、LED 状态机持续生效
+      khwProvisionLoop();
+      khwWsLoop();
+      KhwModeLed::tick();
+      srvTick = now;
+    }
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) break;   // 拿不到帧就断开(下一轮 /stream 会重新进;总比卡在这里好)
     if (fb->format == PIXFORMAT_JPEG) {
@@ -425,10 +445,11 @@ const char CONFIG_HTML[] = R"rawliteral(
 )rawliteral";
 
 void handleRoot() {
+  WebServer& srv = khwHttpServer();
   if (apMode) {
-    server.send(200, "text/html", CONFIG_HTML);
+    srv.send(200, "text/html", CONFIG_HTML);
   } else {
-    server.send(200, "text/plain", "ESP32-CAM running. Stream: /stream");
+    srv.send(200, "text/plain", "ESP32-CAM running. Stream: /stream");
   }
 }
 
@@ -470,21 +491,7 @@ bool streamWriteAll(NetworkClient& c, const uint8_t* buf, size_t len, uint32_t b
   return true;
 }
 
-// ============ WiFi ============
-bool connectWifi() {
-  if (wifiSSID.length() == 0) return false;
-  Serial.printf("Connecting to %s ...\n", wifiSSID.c_str());
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-  return WiFi.status() == WL_CONNECTED;
-}
-
+// ============ SoftAP 兜底 ============
 void startAp() {
   apMode = true;
   WiFi.mode(WIFI_AP);
@@ -492,7 +499,7 @@ void startAp() {
   Serial.printf("AP mode: %s (192.168.4.1)\n", AP_SSID);
 }
 
-// ============ UDP 广播发现(STA 模式才启动,AP 配置态不需要) ============
+// ============ UDP 广播发现(STA 入网后才启动) ============
 void startUdp() {
   if (!udp.begin(UDP_PORT)) {
     Serial.println("UDP begin failed");
@@ -538,17 +545,35 @@ void udpAdvertiseLoop() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Hold BOOT 4s at runtime to clear WiFi & re-enter AP mode");
 
-  // 生成设备 ID(取 MAC 后 6 位)
+  // 设备 ID(MAC 后 6 位)并落盘 NVS "device"/"id"(lib ws hello 与 /status 依赖)
   uint64_t mac = ESP.getEfuseMac();
   char id[16];
   snprintf(id, sizeof(id), "esp32cam-%06x", (unsigned)(mac & 0xFFFFFF));
   deviceId = String(id);
+  khwConfigSet("device", "id", deviceId);
+  khwTokenEnsure();            // M1 存量设备升级:补齐共享令牌(CONTRACT §2)
 
-  pinMode(0, INPUT_PULLUP);  // BOOT 键:开机后长按约 4 秒 = 清除 WiFi 凭据回配网模式
-  loadSettings();
-  loadWifiCreds();
+  pinMode(KHW_BOOT_PIN, INPUT_PULLUP);   // BOOT 键:长按 4s 清凭据+清token 回配网态(provision 状态机检测)
+  loadSettings();                        // 摄像头设置(cam ns)
+
+  KhwModeLed::begin();                   // BOOT:白快闪
+  khwHttpSetFwVersion(FW_VERSION);
+
+  // 板级专属路由必须先于 khwHttpSetup() 注册:WebServer 按注册顺序匹配、先注册者胜,
+  // /config 若在其后才注册会被 lib 的 JSON-only 版遮蔽 → 浏览器 form 配网 400 bad-ssid。
+  // (端口 80 复用 lib 服务器实例,见 khwHttpServer 访问器)
+  WebServer& srv = khwHttpServer();
+  srv.on("/", handleRoot);
+  srv.on("/config", HTTP_POST, handleConfig);   // 覆盖 lib JSON-only 版:兼容浏览器 form + 返回 token
+  srv.on("/settings", HTTP_GET, handleSettingsGet);
+  srv.on("/settings", HTTP_POST, handleSettingsPost);
+  srv.on("/stream", handleStream);
+
+  khwHttpSetup();                        // lib 底座:/status /config /action /unpair
+  khwWsSetup();
+  khwWsSetFwVersion(FW_VERSION);
+  khwActionRegister(handleAction);       // 摄像头板动作总线:status / reboot
 
   if (!initCamera()) {
     Serial.println("Camera init failed, reboot in 3s...");
@@ -556,52 +581,37 @@ void setup() {
     ESP.restart();
   }
 
-  if (!connectWifi()) {
+  // 配网:BLE 优先 + SoftAP 兜底,两者并存(CONTRACT §7)。
+  // 有凭据 → 异步 STA_CONNECTING(不再同步阻塞 15s,LED 黄快闪);
+  // 无凭据 → BLE 广播(KHW-CAM-xxxx)+ SoftAP(ESP32-CAM-Setup)同时开。
+  String ssid;
+  bool hasCreds = khwConfigGet("wifi", "ssid", ssid) && ssid.length() > 0;
+  khwProvisionSetup();
+  if (!hasCreds) {
+    khwBleSetup();
     startAp();
-  } else {
-    apMode = false;
-    Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    khwProvisionSet(ProvisionState::SOFTAP);
+  }
+  Serial.println("HTTP server ready");
+}
+
+void loop() {
+  khwProvisionLoop();      // BOOT 4s 检测 + STA_CONNECTING 超时兜底
+  khwBleLoop();            // BLE 配网结果推进(无凭据态才活跃)
+  khwHttpLoop();
+  khwWsLoop();
+  KhwModeLed::tick();
+
+  // 入网成功后启动 mDNS + UDP 发现(配网态不起;断线自动停,重连再启)
+  if (WiFi.status() == WL_CONNECTED && !udpActive) {
     if (MDNS.begin(deviceId.c_str())) {
       MDNS.addService("_esp32cam", "_tcp", 80);
     }
     startUdp();
+  } else if (WiFi.status() != WL_CONNECTED && udpActive) {
+    udpActive = false;   // 断线停 UDP 发现,重连后再启
   }
-
-  // 路由
-  server.on("/", handleRoot);
-  server.on("/config", HTTP_POST, handleConfig);
-  server.on("/status", handleStatus);
-  server.on("/settings", HTTP_GET, handleSettingsGet);
-  server.on("/settings", HTTP_POST, handleSettingsPost);
-  server.on("/stream", handleStream);
-  server.begin();
-  Serial.println("HTTP server started");
-}
-
-// 开机后长按 BOOT(GPIO0)>4s:清除已存 WiFi 凭据并重启回配网模式(用于重新配网/换家庭WiFi)
-void checkFactoryReset() {
-  static unsigned long pressedAt = 0;
-  if (digitalRead(0) == LOW) {
-    if (pressedAt == 0) pressedAt = millis();
-    else if (millis() - pressedAt > 4000) {
-      pressedAt = 0;
-      prefs.begin("wifi", false);
-      prefs.remove("ssid");
-      prefs.remove("pass");
-      prefs.end();
-      Serial.println("Factory reset: WiFi creds cleared, reboot to AP mode...");
-      delay(100);
-      ESP.restart();
-    }
-  } else {
-    pressedAt = 0;
-  }
-}
-
-void loop() {
-  server.handleClient();
   handleUdp();
   udpAdvertiseLoop();
-  checkFactoryReset();
   delay(2);
 }

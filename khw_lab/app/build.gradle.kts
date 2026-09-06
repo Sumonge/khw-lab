@@ -38,6 +38,7 @@ android {
 dependencies {
     implementation(project(":core"))
     implementation(project(":feature-camera"))
+    implementation(project(":feature-lock"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

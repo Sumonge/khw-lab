@@ -9,7 +9,7 @@
 | 阶段 | 内容 |
 |---|---|
 | **M1(现在)** | 摄像头项目:ESP32-S3-CAM 出图,App 能发现、连上、看视频 |
-| **M2** | 安全令牌、WebSocket 实时控制、录像/截图打磨、下一个产品(运动/灯/声量之一) |
+| **M2** | 安全令牌、WebSocket 实时控制、BLE 配网、模式 LED;接入第一个新产品(电磁锁控制系统,Seeed XIAO ESP32-C3) |
 | **M3+** | 其余智能产品逐个接入(`lib/common` 固件骨架 + `:feature-*` 插件模块) |
 
 M1 虽只有摄像头一张卡,但**必须**按 `:feature-camera` 实现 `CardPlugin` 来搭 —— 这是卡槽骨架,M1 不搭后面就晚了。
@@ -44,6 +44,7 @@ M1 虽只有摄像头一张卡,但**必须**按 `:feature-camera` 实现 `CardPl
 | 智能产品 | 硬件 | 说明 |
 |---|---|---|
 | 摄像头(已有) | ESP32-S3-CAM ×1(GC2145) | 机器视觉 |
+| 电磁锁控制系统(M2 第 1 个) | Seeed XIAO ESP32-C3 ×1(板载 WS2812 RGB) | 3V 电磁锁 ×1(2P XH2.5),MOSFET(AO3400)扩流驱动,预留门磁输入 |
 | 运动控制 | ESP32 ×1 + 步进/伺服驱动 | X-Y 平台 + 工具头切换 |
 | 灯源 | ESP32 ×1(或并入运动板) | 继电器/MOSFET + PWM 调光 |
 | 声量检测 | ESP32 ×1 + I2S 麦克风 | 声级读数 |
@@ -59,11 +60,13 @@ M1 虽只有摄像头一张卡,但**必须**按 `:feature-camera` 实现 `CardPl
 ```
 firmware/
 ├─ lib/common/          ← 所有板共用的骨架
-│   ├─ 配网状态机(SoftAP + /config)
+│   ├─ 配网状态机(BLE 优先 + SoftAP 兜底)
 │   ├─ mDNS 广播(每板广播自己的服务类型)
+│   ├─ 模式 LED 状态机(板载 WS2812/GPIO,统一指示)
 │   ├─ HTTP 服务器底座 + /status + /settings 读写 + NVS 持久化
 │   └─ 统一 JSON 约定 {ok, data, error}
 ├─ board-camera/        ← ESP32-S3-CAM,实现 /stream(摄像头专属)
+├─ board-lock/          ← Seeed XIAO ESP32-C3,电磁锁控制系统,/lock
 ├─ board-motion/        ← 运动板,/motor /tool
 ├─ board-light/         ← 灯源板,/light
 └─ board-sound/         ← 声量板,/level
@@ -79,14 +82,96 @@ firmware/
    POST /config          body {ssid, password} → 存 NVS → 重启转 STA
 
 ② 运行模式(已连局域网,STA)—— 完整 API
-   GET  /stream          → MJPEG 视频流
+   GET  /stream          → MJPEG 视频流(仅摄像头)
    GET  /status          → JSON {id, name, type, fwVersion} ← 兼作 HTTP HEAD 可达性探测
    GET  /settings        → 读当前 {resolution, fps, rotation, quality}
    POST /settings        → 写配置 → 存 NVS + 即时生效
+   POST /unpair          → 清 WiFi 凭据 + 重启回配网态(App 删除设备即断网)
 ```
 
 - `/settings` 直接映射 `esp32-camera` 运行时接口(`set_framesize`/`set_quality`/`set_vflip` 等)。
 - M2 起:所有端点校验共享令牌(配网时 App 生成)。
+
+### 4.3 BLE 配网(M2)
+
+```
+开机无 WiFi 凭据 → BLE 广播配网服务(每板一个 UUID:
+    camera 板 "KHW_CAM",锁板 "KHW_LOCK")
+    → App 扫描到 → GATT 连接 → 写 WiFi SSID/密码特征
+    → 设备连 WiFi → 成功后 App 切回家庭 WiFi → 正常发现
+BLE 连不上(手机太旧/信号差)→ 长按 BOOT 4s 回 SoftAP 兜底
+```
+
+- BLE 为配网**首选**路径,SoftAP 降级为兜底(M1 逻辑保留)。
+- 配网成功后设备生成**共享令牌** → 存 NVS + 通过 BLE/HTTP 回传 App。
+
+### 4.4 模式 LED 状态机(M2,统一)
+
+- XIAO ESP32-C3:**板载 WS2812 RGB**(GPIO7)。
+- ESP32-S3-CAM:板载**无**可控 LED,外接 WS2812 或普通 LED 焊到空闲 GPIO。
+
+| 模式 | 灯效 | 含义 |
+|---|---|---|
+| 上电自检 | 白快闪 3 次 | 开机自检 |
+| 配网就绪 | 蓝呼吸慢闪 | BLE 广播中,等 App |
+| 配网中 | 蓝常亮 | BLE 已连接,正在收凭据 |
+| 连接 WiFi | 黄快闪 | 凭据已存,正在入网 |
+| 在线 | 绿常亮 | 已入网,可控制 |
+| 动作 | 橙短闪一次 | 每次锁动作/指令反馈 |
+| 异常 | 红慢闪 | 故障 |
+| 重置中 | 红快闪 | 长按 BOOT 清凭据重启 |
+
+### 4.5 BLE 配网契约(M2 共享,固件/App 共同依据)
+
+```
+服务 UUID(每板一个,广播 + App 扫描过滤):
+    摄像头板 (KHW_CAM):  6b687763-0000-1000-8000-00805f9b34fb   ("khw" + 'c')
+    锁板     (KHW_LOCK): 6b68776c-0000-1000-8000-00805f9b34fb   ("khw" + 'l')
+
+特征 UUID(两板共用同一组 UUID,服务 UUID 区分产品):
+    SSID   (Write)        6b6877d1-0000-1000-8000-00805f9b34fb
+    PASS   (Write)        6b6877d2-0000-1000-8000-00805f9b34fb
+    STATUS (Read/Notify)  6b6877d3-0000-1000-8000-00805f9b34fb
+
+流程:
+  App 扫描到服务 UUID → GATT 连接 → 写 SSID → 写 PASS
+  → 设备连 WiFi → STATUS Notify 回 JSON:
+      连接中 {"status":"connecting"}
+      成功   {"status":"ok","token":"<16hex>","host":"192.168.x.x"} → 设备重启入网
+      失败   {"status":"fail","error":"wifi"}
+  → App 收到 ok 后保存 token,切回家庭 WiFi 正常发现
+BLE 连不上(手机太旧/信号差)→ 长按 BOOT 4s 清凭据重启回配网态(SoftAP 兜底保留,M1 逻辑)
+```
+
+### 4.6 共享令牌鉴权(M2)
+
+- 配网成功(无论 BLE 还是 SoftAP)时设备生成 **16 位十六进制令牌**(NVS `sec`/`token`),随配网响应回传 App,App 与设备绑定持久化。
+- 设备后续**运行态** HTTP 请求带请求头 `X-Khw-Token: <token>`;WebSocket 用查询参数 `/ws?token=<token>`。
+- 校验失败返回 `401 {"ok":false,"error":"unauthorized"}`。
+- **例外**:`GET /status` 与 `POST /config`(配网态)保持**免令牌**——`/status` 是发现/探测/健康用的身份端点,不含敏感数据,否则 App 在拿到 token 之前无法发现设备;`/config` 是配网态端点,尚无 token。
+- 其余端点(`/stream`、`/settings`、`/action`、`/unpair`、WS)一律校验令牌。
+- M1 存量设备(无 token):固件首次入网自动 `ensure()` 生成;App 端旧设备需**重新配网一次**补齐 token 才能控制(文档注明)。
+
+### 4.7 动作总线 POST /action(M2)
+
+```
+请求  {"action":"lock","params":{...}}       ← params 板级自定义,可空
+响应  {"ok":true,"data":{...}} 或 {"ok":false,"error":"..."}
+
+锁板   action: lock  / unlock / toggle / status   → data.state:"locked"|"unlocked"
+摄像头板 action: status(等价 /status)
+```
+
+- 每个产品把自己的动作处理器注册进 `lib/common` 动作总线;HTTP 动作走 `POST /action`,实时连续控制走 WS(见 4.8)。
+
+### 4.8 WebSocket 通道(M2)
+
+```
+监听端口 8080,路径 /ws,鉴权 ?token=<token>。单客户端,文本帧(JSON)。
+  设备→App  push:  {"type":"status","data":{...}}    状态/锁动作变化即推
+  App→设备  cmd:   {"type":"action","data":{"action":"lock"}}   (HTTP 够用时可选)
+握手: 标准 RFC6455(SHA1 + base64);设备回 ping→pong;单帧消息(FIN=1)。
+```
 
 ---
 
@@ -181,7 +266,11 @@ val registry = CardRegistry()
 - 验收:烧录 → App 配网 → 发现 → 看视频 ✅ 截图/录像 ✅
 
 **M2**
-- 共享令牌鉴权;`DeviceClient` 加 WebSocket 通道(实时连续控制);录像/截图打磨;接入第一个新产品(运动/灯/声量)
+- **App 改名 → khw_hub**(包名保留 `com.khwlab.hub`;显示名、TopBar、相册目录 `Pictures/khw_hub` / `Movies/khw_hub`、权限文案、文档标题全部更新)✅ 已完成(2026-09-06,构建通过)。
+- **固件 0.2.6 修复**(M1 收尾,2026-09-06):
+  - 长按 BOOT(GPIO0)4s 清凭据回配网 **不再被 /stream 饿死**(WebServer 单线程,/stream 死循环占住 loop → 改为独立 FreeRTOS 任务轮询,20ms)。
+  - 新增 **`POST /unpair`** 端点:App 删除设备时调用 → 清 WiFi 凭据重启回配网态 → 设备真正断网不再被发现。
+- 共享令牌鉴权(配网时生成,策略 A);`DeviceClient` 加 WebSocket 通道(实时连续控制);BLE 配网(优先,SoftAP 兜底);模式 LED 状态机;接入第一个新产品 **电磁锁控制系统**(Seeed XIAO ESP32-C3,3V 电磁锁)。
 
 **M3+**
 - 其余智能产品逐个接入 `lib/common` + `:feature-*`
@@ -198,6 +287,8 @@ val registry = CardRegistry()
 | 摄像头可能倒装 | 画面 180° 反 | `set_vflip`/`set_hmirror` + App 侧 Matrix 旋转留开关 |
 | 录像无音频 | 板子无麦克风 | M1 明确不做,要声音另加 I2S 麦克风(独立项目) |
 | 局域网裸奔 | M1 无鉴权 | M2 加共享令牌;真安全需 TLS,重量级暂不做 |
+| SoftAP 配网体验 | 设备热点无外网,部分手机会想跳走 | **M2 换 BLE 配网(首选)**,SoftAP 兜底保留 |
+| 电磁锁电流 | 3V 锁峰值电流未知 | 固件按 GPIO 低边输出设计,电路上 MOSFET(AO3400)扩流,不赌直驱 |
 
 ---
 

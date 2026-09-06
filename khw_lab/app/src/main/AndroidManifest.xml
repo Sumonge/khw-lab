@@ -16,6 +16,19 @@
     <!-- API 30+ 发起 WifiNetworkSpecifier 连接(ConnectivityManager.requestNetwork):系统要求声明 -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
 
+    <!-- BLE 配网(契约 §7):31+ 运行时申请;扫描结果不用于推导位置,故声明 neverForLocation -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- 31 以下:BLE 扫描靠位置权限,蓝牙开关类权限为 normal(仅安装期授权) -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
     <application
         android:name=".App"
         android:allowBackup="true"

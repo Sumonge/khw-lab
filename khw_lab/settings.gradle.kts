@@ -26,3 +26,4 @@ rootProject.name = "khw_lab"
 include(":app")
 include(":core")
 include(":feature-camera")
+include(":feature-lock")

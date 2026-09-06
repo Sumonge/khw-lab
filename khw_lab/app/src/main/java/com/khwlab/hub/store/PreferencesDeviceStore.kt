@@ -12,6 +12,13 @@ class PreferencesDeviceStore(context: Context) : DeviceStore {
     override fun displayName(id: String): String? =
         prefs.getString("name_$id", null)
 
+    override fun token(id: String): String? =
+        prefs.getString("token_$id", null)
+
+    override fun saveToken(id: String, token: String) {
+        prefs.edit().putString("token_$id", token).apply()
+    }
+
     override fun isDeleted(id: String): Boolean =
         prefs.getStringSet(deletedKey, emptySet()).orEmpty().contains(id)
 
@@ -27,6 +34,7 @@ class PreferencesDeviceStore(context: Context) : DeviceStore {
         val set = (prefs.getStringSet(deletedKey, emptySet()).orEmpty() + id).toSet()
         prefs.edit()
             .remove("name_$id")
+            .remove("token_$id")
             .putStringSet(deletedKey, set)
             .apply()
     }
